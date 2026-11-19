@@ -2,11 +2,12 @@ import sys, uuid, re, json
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, QDate, QEvent
-from PySide6.QtGui import QAction, QTextCharFormat, QFont, QTextListFormat
+from PySide6.QtGui import QAction, QTextCharFormat, QFont, QTextListFormat, QColor
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QPushButton,
     QListWidget,QListWidgetItem,QLineEdit,QTextEdit,QLabel,QDateEdit,QMessageBox,QInputDialog,
-    QFileDialog,QStackedWidget,QDialog,QDialogButtonBox,QFormLayout,QSpinBox)
+    QFileDialog,QStackedWidget,QDialog,QDialogButtonBox,QFormLayout,QSpinBox,QCalendarWidget,QComboBox,QCheckBox,QListView,QAbstractItemView,QTabWidget,QTextBrowser)
 from security import Vault
+from organization import Organizer
 
 ROOT=Path.home()/'PersonalSpaceData'
 SETTINGS=ROOT/'settings.json'
@@ -17,14 +18,14 @@ THEMES={'Ivory':('#faf8f3','#ffffff','#282632','#e9e4dc','#795c9b'),
 def now(): return datetime.now().isoformat(timespec='seconds')
 
 class Store:
-    def __init__(self): self.vault=Vault(ROOT)
+    def __init__(self): self.vault=Vault(ROOT); self.org=Organizer(self.vault)
     @property
     def db(self):
         if self.vault.conn is None: raise RuntimeError('Хранилище заблокировано')
         return self.vault.conn
     def journals(self): return self.db.execute('SELECT id,name,type,theme FROM journals ORDER BY rowid').fetchall()
     def entries(self,jid=None,query=''):
-        sql='SELECT e.id,e.journal_id,e.title,e.content,e.event_at,j.name FROM entries e JOIN journals j ON e.journal_id=j.id WHERE 1=1';args=[]
+        sql='SELECT e.id,e.journal_id,e.title,e.content,e.event_at,j.name FROM entries e JOIN journals j ON e.journal_id=j.id WHERE e.deleted_at IS NULL';args=[]
         if jid: sql+=' AND e.journal_id=?';args.append(jid)
         if query:
             # casefold-based filtering supports Cyrillic rather than ASCII-only SQLite LIKE
@@ -42,7 +43,7 @@ class Store:
         return eid
     def save_entry(self,eid,title,content,event):
         self.vault.mutate(lambda db: db.execute('UPDATE entries SET title=?,content=?,event_at=?,updated_at=?,revision=revision+1 WHERE id=?',(title,content,event,now(),eid)))
-    def delete_entry(self,eid): self.vault.mutate(lambda db: db.execute('DELETE FROM entries WHERE id=?',(eid,)))
+    def delete_entry(self,eid): self.org.soft_delete(eid)
     def delete_journal(self,jid): self.vault.mutate(lambda db: db.execute('DELETE FROM journals WHERE id=?',(jid,)))
     def backup(self,path): self.vault.backup(path)
     def restore(self,path,password): self.vault.restore(path,password)
@@ -107,11 +108,23 @@ class Window(QMainWindow):
         for label,method in [('B','bold'),('I','italic'),('U','underline'),('Заголовок','heading'),('Список','list'),('Цитата','quote'),('Ссылка','link'),('↶','undo'),('↷','redo')]:
             b=QPushButton(label);b.clicked.connect(lambda checked=False,m=method:self.format(m));tools.addWidget(b)
         tools.addStretch();self.body=QTextEdit();self.body.setAcceptRichText(True);ev.addWidget(self.body,1)
+        extra=QHBoxLayout();ev.addLayout(extra)
+        self.favorite=QPushButton('☆ В избранное');self.favorite.clicked.connect(self.toggle_favorite);extra.addWidget(self.favorite)
+        b=QPushButton('Теги');b.clicked.connect(self.edit_tags);extra.addWidget(b)
+        b=QPushButton('Категория');b.clicked.connect(self.edit_category);extra.addWidget(b)
+        b=QPushButton('Сон');b.clicked.connect(self.edit_dream);extra.addWidget(b)
+        b=QPushButton('Шаблоны');b.clicked.connect(self.templates_dialog);extra.addWidget(b)
+        b=QPushButton('Вложения');b.clicked.connect(self.attachments_dialog);extra.addWidget(b)
+        extra.addStretch()
         self.title.textChanged.connect(self.changed);self.body.textChanged.connect(self.changed);self.event.dateChanged.connect(self.changed)
         menu=self.menuBar();file=menu.addMenu('Файл')
         self.action(file,'Создать зашифрованную копию',self.backup)
         self.action(file,'Восстановить зашифрованную копию',self.restore)
         self.action(file,'Импортировать старую базу MVP',self.import_old)
+        self.action(file,'Календарь',self.show_calendar)
+        self.action(file,'Корзина',self.show_trash)
+        self.action(file,'Управление тегами',self.manage_tags)
+        self.action(file,'Управление категориями',self.manage_categories)
         self.action(file,'Заблокировать',self.lock)
         self.action(file,'Выход',self.close)
         security=menu.addMenu('Безопасность')
@@ -173,7 +186,7 @@ class Window(QMainWindow):
         if not self.jid: QMessageBox.information(self,'Дневники','Сначала создайте дневник.');return
         if not self.save():return
         self.eid=None;self.loading=True;self.title.clear();self.body.clear();self.event.setDate(QDate.currentDate());self.loading=False
-        self.dirty=False;self.status.setText('Новая запись');self.context.setText(self.journal_name());self.stack.setCurrentWidget(self.editorpage);self.title.setFocus()
+        self.dirty=False;self.favorite.setText('☆ В избранное');self.status.setText('Новая запись');self.context.setText(self.journal_name());self.stack.setCurrentWidget(self.editorpage);self.title.setFocus()
     def journal_name(self):
         for jid,name,kind,theme in self.store.journals():
             if jid==self.jid:return name
@@ -184,7 +197,7 @@ class Window(QMainWindow):
         row=self.store.db.execute('SELECT title,content,event_at FROM entries WHERE id=?',(eid,)).fetchone()
         if not row:return
         self.eid=eid;self.jid=jid;self.loading=True;self.title.setText(row[0]);self.body.setHtml(row[1]);self.event.setDate(QDate.fromString(row[2],'yyyy-MM-dd'))
-        self.loading=False;self.dirty=False;self.status.setText('Сохранено');self.context.setText(self.journal_name());self.stack.setCurrentWidget(self.editorpage);self.body.setFocus()
+        self.loading=False;self.dirty=False;self.refresh_favorite();self.status.setText('Сохранено');self.context.setText(self.journal_name());self.stack.setCurrentWidget(self.editorpage);self.body.setFocus()
     def changed(self,*args):
         if self.loading or self.locked:return
         self.dirty=True;self.status.setText('Есть изменения');self.timer.start()
@@ -204,7 +217,7 @@ class Window(QMainWindow):
         self.stack.setCurrentWidget(self.home);self.refresh_journals(self.jid)
     def delete_entry(self):
         if not self.eid:self.go_home();return
-        if QMessageBox.question(self,'Удаление','Безвозвратно удалить эту запись?',QMessageBox.Yes|QMessageBox.No)==QMessageBox.Yes:
+        if QMessageBox.question(self,'Корзина','Переместить запись в корзину? Её можно восстановить.',QMessageBox.Yes|QMessageBox.No)==QMessageBox.Yes:
             try:
                 self.timer.stop();self.store.delete_entry(self.eid);self.dirty=False;self.eid=None;self.go_home()
             except Exception as ex:QMessageBox.critical(self,'Ошибка',str(ex))
@@ -242,7 +255,7 @@ class Window(QMainWindow):
         if dialog.exec()!=QDialog.Accepted:return
         if QMessageBox.question(self,'Восстановление','Текущие записи будут заменены данными из копии. Рекомендуется предварительно сохранить отдельную резервную копию. Продолжить?',QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes:return
         try:
-            self.store.restore(path,dialog.old.text());self.eid=None;self.stack.setCurrentWidget(self.home);self.refresh_journals()
+            self.store.restore(path,dialog.old.text());self.store.org.upgrade();self.eid=None;self.stack.setCurrentWidget(self.home);self.refresh_journals()
             QMessageBox.information(self,'Готово','Зашифрованная копия успешно восстановлена.')
         except Exception as ex:QMessageBox.critical(self,'Ошибка восстановления',str(ex))
     def change_password(self):
@@ -258,8 +271,195 @@ class Window(QMainWindow):
         if not LEGACY.exists():QMessageBox.information(self,'Импорт','Старая база personal_space.sqlite3 не найдена.');return
         if self.store.journals():QMessageBox.warning(self,'Импорт','Импорт возможен только в пустое защищённое хранилище.');return
         if QMessageBox.question(self,'Импорт старых записей','Импортировать незашифрованную базу первой версии? Оригинальный файл останется на диске для самостоятельного удаления после проверки переноса.',QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes:return
-        try:self.store.vault.import_legacy(LEGACY);self.refresh_journals();QMessageBox.information(self,'Импорт','Записи перенесены в зашифрованное хранилище. ВАЖНО: старая база и ранее созданные ZIP-копии НЕ зашифрованы — проверьте перенос и отдельно удалите старые файлы. Удаление файлов не гарантирует стирание предыдущих копий с SSD и резервных носителей.')
+        try:self.store.vault.import_legacy(LEGACY);self.store.org.upgrade();self.refresh_journals();QMessageBox.information(self,'Импорт','Записи перенесены в зашифрованное хранилище. ВАЖНО: старая база и ранее созданные ZIP-копии НЕ зашифрованы — проверьте перенос и отдельно удалите старые файлы. Удаление файлов не гарантирует стирание предыдущих копий с SSD и резервных носителей.')
         except Exception as ex:QMessageBox.critical(self,'Ошибка импорта',str(ex))
+
+    # Stage 3: every write goes through Organizer -> Vault.mutate -> encrypted disk.
+    def ensure_saved_entry(self):
+        if not self.save():return False
+        if not self.eid:
+            QMessageBox.information(self,'Сначала запишите текст','Добавьте заголовок или содержание записи, чтобы сохранить её перед добавлением свойств.')
+            return False
+        return True
+    def refresh_favorite(self):
+        favorite=self.store.db.execute('SELECT favorite FROM entries WHERE id=?',(self.eid,)).fetchone() if self.eid else None
+        self.favorite.setText('★ В избранном' if favorite and favorite[0] else '☆ В избранное')
+    def toggle_favorite(self):
+        if not self.ensure_saved_entry():return
+        try:self.store.org.toggle_favorite(self.eid);self.refresh_favorite()
+        except Exception as e:QMessageBox.warning(self,'Ошибка',str(e))
+    def edit_tags(self):
+        if not self.ensure_saved_entry():return
+        d=QDialog(self);d.setWindowTitle('Теги записи');layout=QVBoxLayout(d)
+        layout.addWidget(QLabel('Выберите теги (можно несколько):'))
+        tags=self.store.org.tags();current=set(self.store.org.entry_tags(self.eid))
+        widgets=[]
+        for tid,name,color in tags:
+            cb=QCheckBox(name);cb.setChecked(tid in current);layout.addWidget(cb);widgets.append((tid,cb))
+        buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel);buttons.accepted.connect(d.accept);buttons.rejected.connect(d.reject);layout.addWidget(buttons)
+        if d.exec()==QDialog.Accepted:
+            try:self.store.org.set_tags(self.eid,[tid for tid,cb in widgets if cb.isChecked()])
+            except Exception as e:QMessageBox.warning(self,'Ошибка',str(e))
+    def edit_category(self):
+        if not self.ensure_saved_entry():return
+        rows=self.store.org.categories(self.jid);current=self.store.db.execute('SELECT category_id FROM entries WHERE id=?',(self.eid,)).fetchone()[0]
+        options=['Без категории']+[name for _,name in rows];idx=next((i+1 for i,(cid,_) in enumerate(rows) if cid==current),0)
+        value,ok=QInputDialog.getItem(self,'Категория','Категория записи:',options,idx,False)
+        if ok:
+            cid=None if value==options[0] else rows[options.index(value)-1][0]
+            try:self.store.org.set_category(self.eid,cid)
+            except Exception as e:QMessageBox.warning(self,'Ошибка',str(e))
+    def manage_tags(self):
+        d=QDialog(self);d.setWindowTitle('Управление тегами');layout=QVBoxLayout(d);listing=QListWidget();layout.addWidget(listing)
+        def fill():
+            listing.clear()
+            for tid,name,color in self.store.org.tags():
+                item=QListWidgetItem(name);item.setData(Qt.UserRole,tid);listing.addItem(item)
+        def add():
+            name,ok=QInputDialog.getText(d,'Новый тег','Название:')
+            if ok and name.strip():
+                try:self.store.org.add_tag(name);fill()
+                except Exception as e:QMessageBox.warning(d,'Ошибка',str(e))
+        def remove():
+            item=listing.currentItem()
+            if item and QMessageBox.question(d,'Удалить тег','Удалить тег из всех записей? Сами записи сохранятся.',QMessageBox.Yes|QMessageBox.No)==QMessageBox.Yes:
+                self.store.org.delete_tag(item.data(Qt.UserRole));fill()
+        bar=QHBoxLayout();layout.addLayout(bar)
+        for label,callback in [('Добавить',add),('Удалить',remove),('Закрыть',d.accept)]:
+            b=QPushButton(label);b.clicked.connect(callback);bar.addWidget(b)
+        fill();d.exec()
+    def manage_categories(self):
+        if not self.jid:QMessageBox.information(self,'Категории','Выберите дневник.');return
+        d=QDialog(self);d.setWindowTitle('Категории дневника');layout=QVBoxLayout(d);listing=QListWidget();layout.addWidget(listing)
+        def fill():
+            listing.clear()
+            for cid,name in self.store.org.categories(self.jid):
+                item=QListWidgetItem(name);item.setData(Qt.UserRole,cid);listing.addItem(item)
+        def add():
+            name,ok=QInputDialog.getText(d,'Новая категория','Название:')
+            if ok and name.strip():
+                try:self.store.org.add_category(self.jid,name);fill()
+                except Exception as e:QMessageBox.warning(d,'Ошибка',str(e))
+        def remove():
+            item=listing.currentItem()
+            if item and QMessageBox.question(d,'Удаление категории','Снять категорию с записей и удалить её?',QMessageBox.Yes|QMessageBox.No)==QMessageBox.Yes:
+                self.store.org.delete_category(item.data(Qt.UserRole));fill()
+        row=QHBoxLayout();layout.addLayout(row)
+        for name,callback in [('Добавить',add),('Удалить',remove),('Закрыть',d.accept)]:
+            b=QPushButton(name);b.clicked.connect(callback);row.addWidget(b)
+        fill();d.exec()
+    def edit_dream(self):
+        if not self.ensure_saved_entry():return
+        d=QDialog(self);d.setWindowTitle('Параметры сна');d.resize(550,400);form=QFormLayout(d)
+        vivid=QComboBox();vivid.addItems(['Не указано','1 — слабая','2','3','4','5 — очень яркий']);form.addRow('Яркость:',vivid)
+        lucid=QComboBox();lucid.addItems(['Не указано','Да','Нет']);form.addRow('Осознанный сон:',lucid)
+        emotion=QLineEdit();characters=QLineEdit();places=QLineEdit();interpretation=QTextEdit();interpretation.setMaximumHeight(120)
+        for label,widget in [('Эмоции:',emotion),('Персонажи:',characters),('Места:',places),('Моя интерпретация:',interpretation)]:form.addRow(label,widget)
+        old=self.store.org.dream(self.eid)
+        if old:
+            vivid.setCurrentIndex(old[0] or 0);lucid.setCurrentIndex({None:0,1:1,0:2}[old[1]]);emotion.setText(old[2]);characters.setText(old[3]);places.setText(old[4]);interpretation.setPlainText(old[5])
+        buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel);buttons.accepted.connect(d.accept);buttons.rejected.connect(d.reject);form.addRow(buttons)
+        if d.exec()==QDialog.Accepted:
+            try:self.store.org.put_dream(self.eid,vivid.currentIndex() or None,{0:None,1:1,2:0}[lucid.currentIndex()],emotion.text(),characters.text(),places.text(),interpretation.toPlainText())
+            except Exception as e:QMessageBox.warning(self,'Ошибка',str(e))
+    def templates_dialog(self):
+        if not self.jid:return
+        d=QDialog(self);d.setWindowTitle('Шаблоны дневника');layout=QVBoxLayout(d);listing=QListWidget();layout.addWidget(listing)
+        def fill():
+            listing.clear()
+            for tid,name,body in self.store.org.templates(self.jid):
+                item=QListWidgetItem(name);item.setData(Qt.UserRole,body);listing.addItem(item)
+        def add():
+            name,ok=QInputDialog.getText(d,'Название шаблона','Название:')
+            if not ok or not name.strip():return
+            body,ok=QInputDialog.getMultiLineText(d,'Текст шаблона','Текст:',self.body.toPlainText())
+            if ok:
+                try:self.store.org.add_template(self.jid,name,body);fill()
+                except Exception as e:QMessageBox.warning(d,'Ошибка',str(e))
+        def apply():
+            item=listing.currentItem()
+            if not item:return
+            if self.body.toPlainText().strip() and QMessageBox.question(d,'Применить','Добавить текст шаблона в конец текущей записи?',QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes:return
+            self.body.append(item.data(Qt.UserRole));d.accept()
+        row=QHBoxLayout();layout.addLayout(row)
+        for name,callback in [('Создать шаблон',add),('Вставить в запись',apply),('Закрыть',d.accept)]:
+            b=QPushButton(name);b.clicked.connect(callback);row.addWidget(b)
+        fill();d.exec()
+    def attachments_dialog(self):
+        if not self.ensure_saved_entry():return
+        d=QDialog(self);d.setWindowTitle('Вложения (зашифрованы вместе с базой)');d.resize(580,380);layout=QVBoxLayout(d)
+        listing=QListWidget();layout.addWidget(listing)
+        def fill():
+            listing.clear()
+            for aid,name,mime,size in self.store.org.attachments(self.eid):
+                item=QListWidgetItem(f'{name} — {size//1024} КБ');item.setData(Qt.UserRole,aid);listing.addItem(item)
+        def add():
+            path,_=QFileDialog.getOpenFileName(d,'Прикрепить файл','','Медиа (*.png *.jpg *.jpeg *.webp *.mp3 *.wav *.m4a)')
+            if path:
+                try:self.store.org.add_attachment(self.eid,path);fill()
+                except Exception as e:QMessageBox.warning(d,'Ошибка',str(e))
+        def export():
+            item=listing.currentItem()
+            if not item:return
+            name,mime,payload=self.store.org.attachment(item.data(Qt.UserRole))
+            path,_=QFileDialog.getSaveFileName(d,'Экспортировать вложение',name)
+            if not path:return
+            if QMessageBox.question(d,'Экспорт без шифрования','Экспортированный файл будет НЕЗАШИФРОВАННЫМ. Продолжить?',QMessageBox.Yes|QMessageBox.No)==QMessageBox.Yes:
+                try:
+                    from pathlib import Path
+                    Path(path).write_bytes(payload)
+                except Exception as e:QMessageBox.warning(d,'Ошибка',str(e))
+        def remove():
+            item=listing.currentItem()
+            if item and QMessageBox.question(d,'Удаление','Удалить вложение?',QMessageBox.Yes|QMessageBox.No)==QMessageBox.Yes:
+                self.store.org.remove_attachment(item.data(Qt.UserRole));fill()
+        row=QHBoxLayout();layout.addLayout(row)
+        for name,callback in [('Добавить',add),('Экспортировать',export),('Удалить',remove),('Закрыть',d.accept)]:
+            b=QPushButton(name);b.clicked.connect(callback);row.addWidget(b)
+        fill();d.exec()
+    def show_trash(self):
+        if not self.save():return
+        d=QDialog(self);d.setWindowTitle('Корзина');d.resize(550,400);layout=QVBoxLayout(d);listing=QListWidget();layout.addWidget(listing)
+        def fill():
+            listing.clear()
+            for eid,title,event,journal in self.store.org.trash():
+                item=QListWidgetItem(f'{title or "Без названия"} · {journal} · {event}');item.setData(Qt.UserRole,eid);listing.addItem(item)
+        def change(purge=False):
+            item=listing.currentItem()
+            if not item:return
+            if purge and QMessageBox.question(d,'Окончательно удалить','Это действие необратимо. Удалить запись и её вложения?',QMessageBox.Yes|QMessageBox.No)!=QMessageBox.Yes:return
+            try:
+                (self.store.org.purge if purge else self.store.org.restore_entry)(item.data(Qt.UserRole));fill();self.refresh_entries()
+            except Exception as e:QMessageBox.warning(d,'Ошибка',str(e))
+        row=QHBoxLayout();layout.addLayout(row)
+        for name,callback in [('Восстановить',lambda:change(False)),('Удалить навсегда',lambda:change(True)),('Закрыть',d.accept)]:
+            b=QPushButton(name);b.clicked.connect(callback);row.addWidget(b)
+        fill();d.exec()
+    def show_calendar(self):
+        if not self.save():return
+        d=QDialog(self);d.setWindowTitle('Календарь записей');d.resize(580,580);layout=QVBoxLayout(d)
+        calendar=QCalendarWidget();layout.addWidget(calendar);listing=QListWidget();layout.addWidget(listing)
+        highlighted=[]
+        def refresh():
+            listing.clear();date=calendar.selectedDate().toString('yyyy-MM-dd')
+            for eid,jid,title,jname in self.store.org.at_date(date,self.jid):
+                item=QListWidgetItem(f'{title or "Без названия"} · {jname}');item.setData(Qt.UserRole,(eid,jid));listing.addItem(item)
+            counts=self.store.org.calendar_days(calendar.yearShown(),calendar.monthShown(),self.jid)
+            for marked in highlighted:calendar.setDateTextFormat(marked,QTextCharFormat())
+            highlighted.clear()
+            for day in counts:
+                marked=QDate(calendar.yearShown(),calendar.monthShown(),day)
+                fmt=QTextCharFormat();fmt.setFontWeight(QFont.Bold);fmt.setForeground(QColor('#9775cf'))
+                calendar.setDateTextFormat(marked,fmt);highlighted.append(marked)
+            layout_label.setText(f'Записей за месяц: {sum(counts.values())} · На выбранную дату: {listing.count()}')
+        layout_label=QLabel();layout.addWidget(layout_label)
+        calendar.selectionChanged.connect(refresh);calendar.currentPageChanged.connect(lambda y,m:refresh())
+        def open_selected(item):
+            d.accept();self.open_item(item)
+        listing.itemDoubleClicked.connect(open_selected)
+        b=QPushButton('Закрыть');b.clicked.connect(d.accept);layout.addWidget(b)
+        refresh();d.exec()
+
     def lock(self):
         if self.locked:return
         if not self.save():return
@@ -270,7 +470,7 @@ class Window(QMainWindow):
             d=PasswordDialog('unlock')
             if d.exec()!=QDialog.Accepted:
                 self.close();return
-            try:self.store.vault.unlock(d.old.text());break
+            try:self.store.vault.unlock(d.old.text());self.store.org.upgrade();break
             except Exception as ex:QMessageBox.warning(None,'Не удалось разблокировать',str(ex))
         self.locked=False;self.refresh_journals();self.show();self.reset_idle()
     def closeEvent(self,event):
@@ -284,13 +484,13 @@ def main():
     if not store.vault.exists:
         d=PasswordDialog('create')
         if d.exec()!=QDialog.Accepted:return 0
-        try:store.vault.create(d.new.text())
+        try:store.vault.create(d.new.text());store.org.upgrade()
         except Exception as ex:QMessageBox.critical(None,'Не удалось создать хранилище',str(ex));return 1
     else:
         while True:
             d=PasswordDialog('unlock')
             if d.exec()!=QDialog.Accepted:return 0
-            try:store.vault.unlock(d.old.text());break
+            try:store.vault.unlock(d.old.text());store.org.upgrade();break
             except Exception as ex:QMessageBox.warning(None,'Не удалось разблокировать',str(ex))
     w=Window(store);w.show()
     if LEGACY.exists and not store.journals():
